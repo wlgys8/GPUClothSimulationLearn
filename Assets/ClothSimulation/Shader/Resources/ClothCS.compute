@@ -1,0 +1,242 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+
+#pragma kernel Init
+#pragma kernel StepV
+#pragma kernel StepP
+
+
+//所有质点的位置
+RWStructuredBuffer<float4> positions;
+//所有质点的速度
+RWStructuredBuffer<float3> velocities;
+//法线
+RWStructuredBuffer<float4> normals;
+
+//x表示横向质点数量，y表示纵向质点数量,z = x * y
+uint4 size;
+
+//弹性系数,xyz分别对应结构弹簧、剪力弹簧、弯曲弹簧
+float3 springKs;
+
+//弹簧在松弛状态下的长度。xyz分别对应结构弹簧、剪力弹簧、弯曲弹簧
+uniform float3 restLengths;
+
+//单个质点的质量
+uniform float mass;
+
+//阻尼系数
+#define Cd 0.5
+
+//流体(风)参数
+float4 viscousFluidArgs;
+#define Uf viscousFluidArgs.xyz
+#define Cv viscousFluidArgs.w
+
+//单次迭代时间间隔
+float deltaTime;
+#define dt deltaTime
+
+#define totalParticleCount size.z
+
+#define L0 restLengths.x
+#define M mass
+
+
+///球形碰撞体
+uniform float4 collisionBall;
+
+
+
+//结构弹簧的4个方向
+static uint2 SpringDirs[12] = {
+    //结构力
+    {1,0},
+    {0,1},
+    {-1,0},
+    {0,-1},
+    //剪力
+    {-1,-1},
+    {-1,1},
+    {1,-1},
+    {1,1},
+    //弯矩力
+    {-2,0},
+    {2,0},
+    {0,2},
+    {0,-2},
+};
+
+
+static uint getIndex(uint2 id){
+    return id.y * size.x + id.x;
+}
+
+static float3 getPosition(uint index){
+    return positions[index].xyz;
+}
+
+static float3 getPosition(uint2 id){
+    return positions[getIndex(id)].xyz;
+}
+
+static float3 getVelocity(uint index){
+    return velocities[index];
+}
+
+static float3 getNormal(uint index){
+    return normals[index].xyz;
+}
+
+static void setVelocity(uint index,float3 vel){
+    velocities[index] = vel;
+}
+
+static void setPosition(uint index,float3 pos){
+    positions[index] = float4(pos,1);
+}
+
+static bool isValidateId(uint2 id){
+    return id.x >= 0 && id.x < size.x && id.y >=0 && id.y < size.y;
+}
+
+//弹性力计算
+//springType 0,1,2分别代表结构弹簧、剪力弹簧、弯曲弹簧
+static float3 getSpring(float3 p,float3 q,uint springType){
+    float3 dp = p - q;
+    float len = length(dp);
+    float restL = restLengths[springType];
+    return dp * (springKs[springType] * (restL * rcp(len) - 1));
+}
+
+
+static float3 calculateF(uint2 id,float3 position,float3 velocity){
+    uint index = getIndex(id);
+    float3 f = float3(0,0,0);
+    //弹性力求和
+    for(uint i = 0; i < 12; i ++){
+        uint2 nId = id + SpringDirs[i];
+        uint nIndex = getIndex(nId);
+        if(isValidateId(nId)){
+            float3 nPos = getPosition(nIndex);
+            f += getSpring(position,nPos,i / 4);
+        }
+    }
+    //阻尼力
+    float3 fd = - Cd * velocity;
+    f += fd;
+
+    //重力
+    float3 fg = float3(0,-9.8,0) * M;
+    f += fg;
+
+    //模拟风力
+    float3 normal = getNormal(index);
+    float3 fv = Cv * (dot(normal,Uf - velocity)) * normal;
+    f += fv;
+
+    return f;
+}
+
+static float3 calculateF(uint2 id){
+    uint index = getIndex(id);
+    return calculateF(id,getPosition(index),getVelocity(index));
+}
+
+
+static uint2 normalCompuDirs[4] = {
+    {1,0},
+    {0,1},
+    {-1,0},
+    {0,-1},
+};
+
+static void updateNormal(uint2 id){
+    float3 p = getPosition(id);
+    float3 normal = float3(0,0,0);
+    for(uint i = 0; i < 4; i ++){
+        uint j = (i + 1) % 4;
+        uint2 id1 = id + normalCompuDirs[i];
+        uint2 id2 = id + normalCompuDirs[j];
+        if(isValidateId(id1) && isValidateId(id2)){
+            float3 p1 = getPosition(id1);
+            float3 p2 = getPosition(id2);
+            float3 e1 = p1 - p;
+            float3 e2 = p2 - p;
+            float3 n = normalize(cross(e1,e2));
+            normal += n;
+            break;
+        }
+    }
+    normal = normalize(normal);
+    normals[getIndex(id)] = float4(normal,0);
+}
+
+static void detechBallCollision(uint2 id){
+    uint index = getIndex(id);
+    float3 pos = getPosition(index);
+    float3 bCenter = collisionBall.xyz;
+    float bRaidus = collisionBall.w;
+    float disToBall = distance(pos,bCenter) - bRaidus;;
+    if(disToBall < 0){
+        float3 e = normalize(pos - bCenter);
+        pos = pos - disToBall * e;
+
+        float3 v = getVelocity(index);
+
+        v = v - dot(v,e) * e;
+        setVelocity(index,v);
+        setPosition(index,pos);
+        
+    }
+}
+
+static void stepVelocity(uint2 id){
+    uint index = getIndex(id);
+    float3 f = calculateF(id);
+    float3 a = f * rcp(M);
+    float3 velocity = getVelocity(index);
+    velocity = velocity + a * dt;
+    velocities[index] = velocity;
+    updateNormal(id);
+}
+
+
+static void stepPosition(uint2 id){
+    uint index = getIndex(id);
+    float3 velocity = getVelocity(index);
+    float3 position = getPosition(index);
+    position += velocity * dt;
+    setPosition(index,position);
+
+    detechBallCollision(id);
+}
+
+
+#define THREAD_X 8
+#define THREAD_Y 8
+
+//生成网格
+[numthreads(THREAD_X,THREAD_Y,1)]
+void Init (uint3 id : SV_DispatchThreadID)
+{
+    uint index = getIndex(id.xy);
+    positions[index] = float4(id.x * L0,0,id.y * L0,0);
+    velocities[index] = float3(0,0,0);
+    normals[index] = float4(0,1,0,0);
+}
+
+[numthreads(THREAD_X,THREAD_Y,1)]
+void StepV (uint3 id : SV_DispatchThreadID)
+{
+    stepVelocity(id.xy);
+}
+
+[numthreads(THREAD_X,THREAD_Y,1)]
+void StepP (uint3 id : SV_DispatchThreadID)
+{
+    if(id.y == 0 && (id.x == 0 || id.x == size.x - 1) ){
+        //pin two corner
+        return;
+    }
+    stepPosition(id.xy);
+}

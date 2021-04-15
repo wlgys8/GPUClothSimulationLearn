@@ -1,0 +1,9 @@
+*.sln
+*.csproj
+.DS_Store
+.vscode
+temp
+Library
+Logs
+obj
+Recordings
